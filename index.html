@@ -1,0 +1,499 @@
+<!doctype html> 
+<html lang="en"> 
+<head> 
+	<meta charset="UTF-8" />
+	<title>State Farm</title>
+    <script src="phaser-ce/build/phaser.min.js"></script>
+    <style type="text/css">
+        body {
+            margin: 0;
+        }
+    </style>
+</head>
+<body>
+
+<script type="text/javascript">
+
+//initialize the phaser engine and window
+var game = new Phaser.Game("100%", "100%", Phaser.AUTO, '', { preload: preload, create: create, update: update, render: render});
+
+var CELL_SIZE = 32; //the square size of each cell 
+var ROWS = 6;
+var COLUMNS = 7; 
+var MATCHES_NEEDED = 5; //connect x
+var GAME_AREA_START_Y = 50; //the top of the grid
+var REALTIME = true; //false for turn based, true for realtime
+var AI_TURN_TIME = 2; //ai turn speed in seconds
+var AI_TURN_VARIANCE = 1.5; //variance in the ai drop speed in seconds
+var AI_START_DELAY = 5; //time it takes for the ai to take its first turn in seconds
+var DROP_TIME = 1000; //time the full drop animation takes in milliseconds
+var BRICK_TIME = 1000; //time window after a drop that other shots will be bricked in milliseconds
+var HOPPER_BALL_SIZE = 64; //currently relates to the pixel size of the hopper balls
+var HOPPER_BALL_X_SPACE = 12; //space between hopper balls
+var BALL_HOPPER_START_Y = 500; //Vertical position of the hopper
+var HOPPER_COUNT = 4; //number of balls in the hopper
+var ACTIVE_BALL_Y = 380; //where the active ball hovers
+var ACTIVE_BALL_SHOOT_DISTANCE = 20; //how far away from the active ball vertical position you need to pull to shoot
+var ACTIVE_BALL_Y_EXTENTS = 50; //how far you can possibly pull the ball up or down, must be bigger than the shoot distance
+var ACTIVE_BALL_TRANSITION_TIME = 100; //time it takes for the ball to go from the hopper to the active position
+var POINTER_START_COLUMN = 4; //the first column targeted by default
+var SHOOT_UP_ANIM_TIME = 350; //time for the active ball to go off screen, then goes to the drop animation
+
+var ai_timer = 0;
+var grid;
+var hopper_balls;
+var hopper_positions;
+var aiming = false;
+var columnsBusy;
+var game_state = "intro";
+var bg;
+var active_ball;
+var targeted_column;
+var input_down_x;//logs where the input first touches down to calculate swipes
+var input_down_y; 
+var active_ball_start_x;
+var active_ball_start_y;
+var active_ball_range_x; //set when initializing the hopper, the half width of the hopper
+var goal_pointer;
+var thrown_ball;
+var game_area_start_x = 0; 
+
+
+//Load in assets
+function preload() {
+    game.load.image('circle', 'assets/circle.png');
+    game.load.image('redcircle', 'assets/redcircle.png');
+    game.load.image('yellowcircle', 'assets/yellowcircle.png');
+    game.load.image('title', 'assets/title.png');
+    game.load.image('intro', 'assets/intro.png');
+    game.load.image('playerwin', 'assets/playerwin.png');
+    game.load.image('computerwin', 'assets/computerwin.png');
+    game.load.image('draw', 'assets/drawmatch.png');
+    game.load.image('hopperball', 'assets/hopperball.png');
+    game.load.image('goalpointer', 'assets/pointer.png');
+    //game.time.advancedTiming = true;
+}
+
+//initialize the game
+function create() {
+    game.inputEnabled = true;
+    game.input.addPointer();
+    change_state("title");
+    game.input.onDown.add(onDown, this);
+    game.input.onUp.add(onUp, this);
+}
+
+function update() {
+    if(game_state == "player"){
+        if(REALTIME){
+            ai_timer -= game.time.physicsElapsed;
+            if(ai_timer <= 0){
+                ai_turn();
+            }
+        }
+        aim_ball();
+    }
+}
+
+function render(){
+    //game.debug.text(game.time.fps || '--', 2, 14, "#00ff00");
+}
+
+function change_state(state){
+    game_state = state;
+    if(game_state == "title"){
+        if(bg != null){
+            bg.destroy();
+            bg = null;
+        }
+        initialize_grid();
+        bg = game.add.sprite(0, 0, 'title');
+        bg.x = (game.width / 2) - (bg.width / 2);
+        bg.inputEnabled = true;
+        bg.events.onInputDown.add(next_state, this);
+    }
+    else if(game_state == "intro"){
+        bg.destroy();
+        bg = game.add.sprite(0, 0, 'intro');
+        bg.x = (game.width / 2) - (bg.width / 2);
+        bg.inputEnabled = true;
+        bg.events.onInputDown.add(initialize_hopper, this);
+        bg.events.onInputDown.add(next_state, this);
+        ai_timer = AI_START_DELAY;
+    }
+    else if (game_state == "player"){
+        if(bg != null){
+            bg.destroy();
+            bg = null;
+        }
+    } 
+    else if (game_state == "enemy"){
+        //take ai turn
+        console.log("enemy turn");
+        game.time.events.add(Phaser.Timer.SECOND * AI_TURN_TIME, ai_turn, this);
+    }
+    else if(game_state == "win"){
+        game.time.events.add(Phaser.Timer.SECOND * 2.0, show_end_screen, this);
+    }
+    else if (game_state == "lose"){
+        game.time.events.add(Phaser.Timer.SECOND * 2.0, show_end_screen, this);
+    }
+    else if (game_state == "draw"){
+        game.time.events.add(Phaser.Timer.SECOND * 2.0, show_end_screen, this);
+    }
+}
+
+function next_state(){
+    if(game_state == "title"){
+        change_state("intro");
+    }
+    else if(game_state == "intro"){
+        change_state("player");
+    }
+    else if(game_state == "win" || game_state == "lose"){
+        change_state("title");
+    }
+}
+
+function ai_turn(){
+    var has_shot = false;
+    while(!has_shot){
+        console.log("trying shot");
+        var random_column = game.rnd.integerInRange(0, COLUMNS - 1);
+        if(drop(random_column, false)){
+            has_shot = true;
+            ai_timer = AI_TURN_TIME + game.rnd.realInRange(-AI_TURN_VARIANCE, AI_TURN_VARIANCE);
+        }
+    }
+}
+
+class cell{
+    constructor(owner, spritex, spritey){
+        this.owner = "empty";
+        this.xpos = spritex;
+        this.sprite = game.add.sprite(spritex * CELL_SIZE + game_area_start_x, spritey * CELL_SIZE + GAME_AREA_START_Y, 'circle');
+        this.sprite.inputEnabled = true;
+    }
+    
+    set_owner(new_owner){
+        this.owner = new_owner;
+        this.update_owner();
+    }
+
+    update_owner(){
+        if(this.owner == "empty"){
+            this.sprite.loadTexture('circle');
+        } 
+        else 
+        {
+            var ball = 'yellowcircle'
+            if(this.owner == "player"){ //create new ball sprite that animates to the cell
+                ball = 'redcircle';
+            }
+            var ball = game.add.sprite(this.xpos * CELL_SIZE + game_area_start_x, -10, ball);
+            game.add.tween(ball).to( {y: this.sprite.y }, 1000, Phaser.Easing.Bounce.Out, true);
+        }
+    }
+}
+
+function initialize_hopper(){
+    hopper_balls = new Array(HOPPER_COUNT);
+    hopper_positions = new Array(HOPPER_COUNT);
+    var hopper_width = (HOPPER_COUNT * HOPPER_BALL_SIZE) + ((HOPPER_COUNT - 2) * HOPPER_BALL_X_SPACE);
+    active_ball_range_x = hopper_width / 2;
+    var start_x = (game.width / 2) - (hopper_width / 2);
+    //set up hopper positions based on constant values
+    for(i = 0; i < HOPPER_COUNT; i++){
+        var x = start_x;
+        if(i > 0){
+            x += HOPPER_BALL_X_SPACE * i;
+        }
+        x += HOPPER_BALL_SIZE * i;
+        hopper_positions[i] = x;
+    }
+    for(i = 0; i < HOPPER_COUNT; i++){
+        hopper_balls[i] = game.add.sprite(-hopper_positions[i], BALL_HOPPER_START_Y, 'hopperball');
+        game.add.tween(hopper_balls[i]).to({x: hopper_positions[i]}, ((HOPPER_COUNT + 2) * 600) - (i * 700), Phaser.Easing.Linear.Out, true);
+        hopper_balls[i].inputEnabled = true;
+        hopper_balls[i].events.onInputDown.add(get_hopper_ball, this);
+        hopper_balls[i].ball_index = i;
+    }
+}
+
+function get_hopper_ball(sprite, pointer){
+    if(active_ball == null && hopper_balls[0].x == hopper_positions[0]){
+        console.log(sprite.ball_index);
+        //pop the ball out of the hopper, shift any to the left of it over 1 and add a new one    
+        for(i = sprite.ball_index; i >= 0; i--){
+            if(i - 1 >= 0){
+                hopper_balls[i] = hopper_balls[i - 1];
+                game.add.tween(hopper_balls[i]).to({x: hopper_positions[i]}, 100, Phaser.Easing.Linear.Out, true);
+                hopper_balls[i].inputEnabled = true; //turn these three lines into a method since they are repeated in three places
+                hopper_balls[i].events.onInputUp.add(get_hopper_ball, this);
+                hopper_balls[i].ball_index = i;
+            }
+        }
+        hopper_balls[0] = game.add.sprite(-hopper_positions[0], BALL_HOPPER_START_Y, 'hopperball');
+        game.add.tween(hopper_balls[0]).to({x: hopper_positions[0]}, 100, Phaser.Easing.Linear.Out, true);
+        hopper_balls[0].inputEnabled = true;
+        hopper_balls[0].events.onInputUp.add(get_hopper_ball, this);
+        hopper_balls[0].ball_index = 0;
+        
+        //move this ball to the active ball position and assign the active_ball var to it
+        sprite.events.onInputUp.removeAll();
+        game.add.tween(sprite).to({y: ACTIVE_BALL_Y}, ACTIVE_BALL_TRANSITION_TIME, Phaser.Easing.Quartic.InOut, true);
+        active_ball = sprite;
+        active_ball_start_x = active_ball.x;
+        active_ball_start_y = ACTIVE_BALL_Y;
+        game.time.events.add(ACTIVE_BALL_TRANSITION_TIME, function(){aiming = true;}, this);
+
+    }
+}
+
+function aim_ball(){
+    if(active_ball != null && aiming){
+        if(game.input.activePointer.isDown) // move the ball around if your finger or mouse is down
+        {
+            var left_extent = (game.width / 2) - active_ball_range_x - (active_ball.width / 2);
+            var right_extent = (game.width / 2) + active_ball_range_x - (active_ball.width / 2);
+            var bottom_extent = ACTIVE_BALL_Y + ACTIVE_BALL_Y_EXTENTS;
+            var top_extent = ACTIVE_BALL_Y - ACTIVE_BALL_Y_EXTENTS;
+
+            var target_x = active_ball_start_x - (input_down_x - game.input.x);
+            if(target_x > left_extent && target_x < right_extent)
+            {
+                active_ball.x = target_x;
+            }
+            var target_y = active_ball_start_y - (input_down_y - game.input.y);
+            if(target_y > top_extent && target_y < bottom_extent)
+            {
+                active_ball.y = target_y; 
+            }
+            //move the column selector to the appropriate column
+            targeted_column = game.math.roundTo(((active_ball.x - left_extent) / (right_extent - left_extent)) * (COLUMNS - 1), 0);
+            goal_pointer.x = grid[targeted_column][0].sprite.x;
+        }
+        else 
+        {
+            //check if the ball is in a shooting position
+            if(active_ball.y > ACTIVE_BALL_Y + ACTIVE_BALL_SHOOT_DISTANCE || active_ball.y < ACTIVE_BALL_Y - ACTIVE_BALL_SHOOT_DISTANCE){
+                shoot_ball();
+            } else 
+            {
+                active_ball.y = game.math.linear(active_ball.y, ACTIVE_BALL_Y, game.time.physicsElapsed * 2);
+            }
+        }
+    }
+}
+
+function shoot_ball(){
+    console.log("Shoot");
+    game.add.tween(active_ball).to( {y: -active_ball.height * 2 }, SHOOT_UP_ANIM_TIME, Phaser.Easing.Quartic.In, true);
+    thrown_ball = active_ball;
+    active_ball = null;
+    game.time.events.add(SHOOT_UP_ANIM_TIME, function(){thrown_ball.destroy; aiming = false; drop(targeted_column, true);}, this);
+}
+
+function initialize_grid(){
+
+    game_area_start_x = (game.width / 2) - ((COLUMNS * CELL_SIZE) / 2);
+
+    grid = new Array(ROWS);
+    for(i = 0; i < COLUMNS; i++){
+        grid[i] = new Array(COLUMNS)
+    }
+    for(x = 0; x < COLUMNS; x ++){
+        for(y = 0; y < ROWS; y++){
+            grid[x][y] = new cell("empty", x,y);
+        }
+    }
+    columnsBusy = new Array(COLUMNS);
+    for(x = 0; x < COLUMNS; x ++){
+        columnsBusy[x] = false;
+    }
+    goal_pointer = game.add.sprite(grid[POINTER_START_COLUMN][0].sprite.x, grid[POINTER_START_COLUMN][0].sprite.y - CELL_SIZE, 'goalpointer');
+}
+
+function drop(x, player){
+    if((player && game_state == "player" || !player && game_state == "enemy") || (REALTIME && game_state == "player")) {
+        for(y = ROWS, y > 0; y--;){
+            if(grid[x][y].owner == "empty"){
+                if(!columnsBusy[x])
+                {
+                    if(player){
+                        grid[x][y].set_owner("player");
+                        if(checkMatches("player") == false && !REALTIME){
+                            change_state("enemy");
+                        }
+                    } else {
+                        grid[x][y].set_owner("enemy");
+                        if(checkMatches("enemy") == false && !REALTIME){
+                            change_state("player");
+                        }
+                    }                
+                    columnsBusy[x] = true;
+                    game.time.events.add(BRICK_TIME, function(){end_drop(x)}, this);
+                } else {
+                    console.log("BRICK");
+                }
+                return true;            
+                
+            }
+        }
+    }
+    return false;
+}
+
+function end_drop(x){
+    columnsBusy[x] = false;
+}
+
+function show_end_screen(){
+    image = 'playerwin';
+    if(game_state == "lose"){
+        image = 'computerwin';
+    }
+    else if(game_state == "draw"){
+        image = 'draw';
+    }
+    bg = game.add.sprite(0, 0, image);
+    bg.x = (game.width / 2) - (bg.width / 2);
+    bg.inputEnabled = true;
+    bg.events.onInputDown.add(next_state, this);
+    //clean up objects
+    for(x = 0; x < COLUMNS; x ++){
+        for(y = 0; y < ROWS; y++){
+            grid[x][y].sprite.destroy();
+        }
+    }  
+    for(i = 0; i < HOPPER_COUNT; i++){
+        hopper_balls[i].destroy();
+    }
+    goal_pointer.destroy();
+    if(active_ball != null){
+        active_ball.destroy();
+    }
+    aiming = false;
+}
+
+function checkMatches(player){
+    var matches = 0;
+    var player_won = false;
+    //check horizontal
+    for(y = 0; y < ROWS; y++){
+        matches = 0;
+        for(x = 0; x < COLUMNS; x++){
+            if(grid[x][y].owner == player){
+                matches++;
+            } else {
+                matches = 0;
+            }
+            if(matches >= MATCHES_NEEDED){
+                player_won = true;
+                break;
+            }
+        }
+    }
+
+    //check vertical
+    for(x = 0; x < COLUMNS; x++){
+        matches = 0;
+        for(y = 0; y < ROWS; y++){
+            if(grid[x][y].owner == player){
+                matches++;
+            } else {
+                matches = 0;
+            }
+            if(matches >= MATCHES_NEEDED){
+                player_won = true;
+                break;
+            }
+        }
+    }
+
+    //check diagonals 
+    for(x = 0; x < COLUMNS; x++){
+        for(y = 0; y < ROWS; y++){ //diagonals not calculating right on left column
+
+            if(grid[x][y].owner == player){
+                //down right
+                matches = 0;
+                if(x + MATCHES_NEEDED <= COLUMNS && y + MATCHES_NEEDED <= ROWS){
+                    for(i = 0; i < MATCHES_NEEDED; i ++){
+                        if(grid[x + i][y + i].owner == player){
+                            matches++;
+                        } else {
+                            matches = 0;
+                        }
+                    }
+                    if(matches >= MATCHES_NEEDED){
+                        player_won = true;
+                        break;
+                    }
+                }
+                //down left
+                matches = 0;
+                if(x + 1 - MATCHES_NEEDED > 0 && y + MATCHES_NEEDED <= ROWS){
+                    for(i = 0; i < MATCHES_NEEDED; i ++){
+                        if(grid[x - i][y + i].owner == player){
+                            matches++;
+                        } else {
+                            matches = 0;
+                        }
+                    }
+                    if(matches >= MATCHES_NEEDED){
+                        player_won = true;
+                        break;
+                    }
+                }
+            }
+
+        }        
+    }
+
+    if(player_won){        
+        console.log(player + " wins");
+        if(player == "player"){
+            change_state("win");
+        } else {
+            change_state("lose");
+        }
+        return true;
+    }
+
+    //check to see if the grid is full
+    var grid_full = true;
+    for(x = 0; x < COLUMNS; x++){
+        if(grid[x][0].owner == "empty"){
+            grid_full = false;
+            break;
+        }
+    }
+    if(grid_full){
+        change_state("draw");
+        return true;
+    }
+
+    return false;
+}
+
+function onDown(pointer, doubleTap){
+    input_down_x = game.input.x;
+    input_down_y = game.input.y;
+    if(active_ball != null && aiming){
+        active_ball_start_x = active_ball.x;
+        active_ball_start_y = active_ball.y;
+    }
+}
+
+function onUp(pointer){
+    if(active_ball != null && aiming){
+        active_ball_start_x = active_ball.x;
+        active_ball_start_y = active_ball.y;
+    }
+}
+
+</script>
+
+</body>
+</html>
